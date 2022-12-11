@@ -1,10 +1,10 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"time"
 
@@ -25,22 +25,37 @@ func main() {
 	http.ListenAndServe(":8080", nil)
 }
 
-func getCurrencyRate() (*currencyRate, string, error) {
-	resp, error := http.Get("https://economia.awesomeapi.com.br/json/last/USD-BRL")
-	if error != nil {
-		return nil, error
+func getCurrencyRate() (*currencyRate, bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://economia.awesomeapi.com.br/json/last/USD-BRL", nil)
+	if err != nil {
+		return nil, false, err
 	}
-	defer resp.Body.Close()
-	body, error := ioutil.ReadAll(resp.Body)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, false, err
+	}
+	defer res.Body.Close()
+	body, error := ioutil.ReadAll(res.Body)
 	if error != nil {
-		return nil, error
+		return nil, false, error
 	}
 	var c currencyRate
 	error = json.Unmarshal(body, &c)
 	if error != nil {
-		return nil, error
+		return nil, false, error
 	}
-	return &c, string(body), nil
+	select {
+	case <-time.After(200 * time.Millisecond):
+
+		return &c, true, nil
+
+	case <-ctx.Done():
+		return &c, false, nil
+
+	}
+
 }
 func insertCurrencyCheck(currencyRate *currencyRate) error {
 	db, err := databaseFactory()
@@ -48,7 +63,7 @@ func insertCurrencyCheck(currencyRate *currencyRate) error {
 		panic(err)
 	}
 	defer db.Close()
-	stmt, err := db.Prepare("INSERT INTO currency_check(code,codein,name,high,low,varbid,pctchange,bid,ask,timestamp,createdate) values(?,?,?,?,?,?,?,?,?,?,?) ")
+	stmt, err := db.Prepare("INSERT INTO currency_check(code,codein,name,high,low,varbid,pctchange,bid,ask,timestamp,create_date) values(?,?,?,?,?,?,?,?,?,?,?) ")
 	if err != nil {
 		return err
 	}
@@ -59,28 +74,31 @@ func insertCurrencyCheck(currencyRate *currencyRate) error {
 	return nil
 }
 func currencyHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	currencyRateGetStruct, jsonString, err := getCurrencyRate()
+	//ctx := r.Context()
+	currencyRateGetStruct, haveTimeout, err := getCurrencyRate()
 	if err != nil {
 		panic(err)
+	}
+	if haveTimeout {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusRequestTimeout)
+		w.Write([]byte("Timeout de consulta atingido, por favor tente novamente"))
+		return
 	}
 	err = insertCurrencyCheck(currencyRateGetStruct)
 	if err != nil {
 		panic(err)
 	}
-	w.Write([]byte(jsonString))
-	select {
-	case <-time.After(10 * time.Microsecond):
-
-		w.Write([]byte("Timeout de gravacao no banco atingido, por favor tente novamente"))
-	case <-time.After(200 * time.Microsecond):
-
-		w.Write([]byte("Timeout de consulta atingido, por favor tente novamente"))
-
-	case <-ctx.Done():
-		// Imprime no comand line stdout
-		log.Println("Request cancelada pelo cliente")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	result, err := json.Marshal(currencyRateGetStruct.Usdbrl.Bid)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
 	}
+
+	w.Write(result)
+
 }
 
 type currencyRate struct {
@@ -100,7 +118,7 @@ type currencyRate struct {
 }
 
 func databaseFactory() (*sql.DB, error) {
-	const filePath string = "./database/currency.db"
+	const filePath string = "../database/currency.db"
 	db, err := sql.Open("sqlite3", filePath)
 	if err != nil {
 		return nil, err
@@ -111,7 +129,7 @@ func databaseSeederHandler(db *sql.DB) error {
 	const create string = `
 	CREATE TABLE IF NOT EXISTS currency_check (
 	id INTEGER NOT NULL PRIMARY KEY,
-	code        VARCHAR(3) NOT NULL PRIMARY KEY,
+	code        VARCHAR(3) NOT NULL,
 	codein      VARCHAR(3) NOT NULL,
 	name        VARCHAR(31) NOT NULL,
 	high        NUMERIC(6,4) NOT NULL,
